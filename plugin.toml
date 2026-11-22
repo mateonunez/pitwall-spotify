@@ -1,0 +1,12 @@
+# pitwall-spotify: what plays, in the status line and in pitwall's dashboard.
+name = "spotify"
+description = "What plays, on the status line and in a dashboard view: play, pause, skip, save, queue and browse playlists"
+version = "0.1.0"
+pitwall = ">=0.2.1"
+run = "bin/spotify"             # pitwall calls it: hook <event> … · view · act <action> <row> [answer] · cmd …
+events = "lane.state"           # a lane that moves is a cheap moment to notice music started elsewhere
+view = "Spotify"
+command = "spotify"             # pitwall spotify login · toggle · next · prev · like · volume · status
+segment = "♫"                   # @pitwall_seg_spotify: the track, while it plays
+segment_color = "muted"
+segment_where = "rule"          # beside the machine's numbers, on the panes' bottom rule

@@ -1,0 +1,820 @@
+#!/usr/bin/env python3
+"""spotify: the Spotify plugin for pitwall.
+
+  spotify cmd login | logout | status        pitwall spotify …: log in once (the browser, one click), see who is in
+  spotify cmd toggle | next | prev | like     play or pause, skip, go back, save what plays to your Liked Songs
+  spotify cmd volume <0-100 | + | ->          the volume of the device that plays
+  spotify view                                pitwall's dashboard view: now playing, up next, recently played
+  spotify act <action> <row> [answer]         what a view action does
+  spotify hook lane.state …                   a lane moved: look at what plays, if nobody looked for a while
+
+Talks to the Spotify Web API as you, through OAuth with PKCE: no secret is stored, only your app's client ID and
+the tokens, in ~/.config/pitwall/spotify (readable by you alone). While music plays, a small process keeps the
+status line's track current: it looks when the track should end, or every 30 s at most, and stops when the music
+does. Playback control needs Spotify Premium.
+"""
+import base64
+import calendar
+import contextlib
+import hashlib
+import http.server
+import io
+import json
+import os
+import re
+import secrets
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+
+HERE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "pitwall")
+CONF = os.path.join(CONFIG_DIR, "spotify")
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "pitwall", "spotify")
+PANELS = os.path.join(CACHE_DIR, "panels.sqlite")
+API = os.environ.get("PITWALL_SPOTIFY_API", "https://api.spotify.com/v1")
+ACCOUNTS = os.environ.get("PITWALL_SPOTIFY_ACCOUNTS", "https://accounts.spotify.com")
+PORT = int(os.environ.get("PITWALL_SPOTIFY_PORT", "43828"))
+REDIRECT = f"http://127.0.0.1:{PORT}/callback"
+# User authorization scopes. Spotify Open Access scopes belong to partner accounts.
+SCOPES = (
+    "ugc-image-upload user-read-playback-state user-modify-playback-state user-read-currently-playing "
+    "app-remote-control streaming playlist-read-private playlist-read-collaborative "
+    "playlist-modify-private playlist-modify-public user-follow-modify user-follow-read "
+    "user-read-playback-position user-top-read user-read-recently-played user-library-modify "
+    "user-library-read user-read-email user-read-private"
+)
+SEG = "@pitwall_seg_spotify"
+PITWALL = os.environ.get("PITWALL") or "pitwall"
+SELF = os.path.realpath(__file__)
+
+
+class NeedLogin(Exception):
+    pass
+
+
+class SpotifyError(Exception):
+    def __init__(self, status, reason):
+        super().__init__(reason)
+        self.status, self.reason = status, reason
+
+
+# --- tmux ----------------------------------------------------------------------------------------------------
+
+def tmux(*args):
+    return subprocess.run(["tmux", *args], capture_output=True, text=True).stdout.rstrip("\n")
+
+
+def option(name, default=""):
+    return tmux("show", "-gqv", name) or default
+
+
+# --- credentials -----------------------------------------------------------------------------------------------
+
+def load():
+    try:
+        with open(CONF) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save(conf):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = f"{CONF}.{os.getpid()}"
+    with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        json.dump(conf, f)
+    os.replace(tmp, CONF)
+
+
+def client_id():
+    """Your Spotify app's client ID: the environment, a .env beside the plugin or here, what login saved, or asked."""
+    if os.environ.get("SPOTIFY_CLIENT_ID"):
+        return os.environ["SPOTIFY_CLIENT_ID"].strip()
+    for env in (os.path.join(HERE, ".env"), os.path.join(os.getcwd(), ".env")):
+        try:
+            with open(env) as f:
+                for line in f:
+                    k, _, v = line.strip().partition("=")
+                    if k.strip() == "SPOTIFY_CLIENT_ID" and v.strip():
+                        return v.strip().strip("'\"")
+        except OSError:
+            pass
+    saved = load().get("client_id")
+    if saved:
+        return saved
+    if sys.stdin.isatty():
+        print(f"Your Spotify app's client ID (developer.spotify.com/dashboard, with {REDIRECT} as a redirect URI):")
+        return input("  client ID: ").strip()
+    return ""
+
+
+def form(url, fields):
+    req = urllib.request.Request(url, data=urllib.parse.urlencode(fields).encode(), method="POST",
+                                 headers={"content-type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())
+
+
+def token():
+    """A valid access token, refreshed when it is about to expire. NeedLogin when there is none, or it was revoked."""
+    conf = load()
+    if not conf.get("refresh_token"):
+        raise NeedLogin()
+    if conf.get("expires_at", 0) - time.time() > 60:
+        return conf["access_token"]
+    try:
+        t = form(f"{ACCOUNTS}/api/token", {"grant_type": "refresh_token", "refresh_token": conf["refresh_token"],
+                                           "client_id": conf["client_id"]})
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 401):
+            raise NeedLogin() from e
+        raise
+    conf.setdefault("panel_session", session_key(conf))
+    conf.update(access_token=t["access_token"], expires_at=time.time() + t.get("expires_in", 3600),
+                refresh_token=t.get("refresh_token") or conf["refresh_token"])
+    save(conf)
+    return conf["access_token"]
+
+
+def call(method, path, body=None, retry=True):
+    """The Web API as you. None for an empty answer (204); SpotifyError with Spotify's reason otherwise."""
+    data = json.dumps(body).encode() if body is not None else (b"" if method in ("PUT", "POST") else None)
+    req = urllib.request.Request(f"{API}{path}", data=data, method=method,
+                                 headers={"authorization": f"Bearer {token()}", "content-type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            raw = r.read()
+            return json.loads(raw) if raw.strip() else None
+    except urllib.error.HTTPError as e:
+        if e.code == 401 and retry:  # expired early: refresh once
+            conf = load()
+            conf["expires_at"] = 0
+            save(conf)
+            return call(method, path, body, retry=False)
+        try:
+            reason = (json.loads(e.read() or b"{}").get("error") or {}).get("reason") or e.reason
+        except ValueError:
+            reason = e.reason
+        raise SpotifyError(e.code, str(reason)) from e
+
+
+# --- login -----------------------------------------------------------------------------------------------------
+
+PAGE = """<!doctype html><meta charset="utf-8"><title>pitwall · Spotify</title>
+<style>body{margin:0;height:100vh;display:grid;place-items:center;background:#0a0a0a;color:#e5e7eb;
+font:15px/1.6 -apple-system,system-ui,sans-serif}main{text-align:center}b{color:#f59e0b}
+h1{font:600 22px/1 -apple-system,system-ui;margin:0 0 12px}p{color:#9ca3af;margin:0}</style>
+<main><h1>pit<b>wall</b> ♫ Spotify</h1><p>%s</p></main>"""
+
+
+def login():
+    cid = client_id()
+    if not cid:
+        print("spotify: no client ID. Put SPOTIFY_CLIENT_ID in the environment or in a .env beside the plugin.", file=sys.stderr)
+        return 1
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state, got = secrets.token_urlsafe(16), {}
+
+    class Callback(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            if not self.path.startswith("/callback"):
+                self.send_response(404)
+                self.end_headers()
+                return
+            ok = q.get("state", [""])[0] == state and "code" in q
+            got.update(code=q.get("code", [""])[0] if ok else "", error=q.get("error", [""])[0] or ("" if ok else "state"))
+            self.send_response(200)
+            self.send_header("content-type", "text/html; charset=utf-8")
+            self.end_headers()
+            msg = "Connected. You can close this tab and go back to your terminal." if ok else f"Not connected: {got['error']}."
+            self.wfile.write((PAGE % msg).encode())
+
+        def log_message(self, *_):
+            pass
+
+    try:
+        server = http.server.HTTPServer(("127.0.0.1", PORT), Callback)
+    except OSError:
+        print(f"spotify: port {PORT} is busy (PITWALL_SPOTIFY_PORT picks another, with its redirect URI in your app)", file=sys.stderr)
+        return 1
+    url = f"{ACCOUNTS}/authorize?" + urllib.parse.urlencode({
+        "client_id": cid, "response_type": "code", "redirect_uri": REDIRECT, "scope": SCOPES, "state": state,
+        "code_challenge_method": "S256", "code_challenge": challenge})
+    print("spotify: opening the browser to log in…")
+    print(f"  (if it does not open: {url})")
+    threading.Thread(target=lambda: webbrowser.open(url), daemon=True).start()
+    server.timeout = 1
+    deadline = time.time() + 180
+    while not got and time.time() < deadline:
+        server.handle_request()
+    server.server_close()
+    if not got.get("code"):
+        print(f"spotify: not logged in ({got.get('error') or 'no answer in 3 minutes'})", file=sys.stderr)
+        return 1
+    t = form(f"{ACCOUNTS}/api/token", {"grant_type": "authorization_code", "code": got["code"], "redirect_uri": REDIRECT,
+                                       "client_id": cid, "code_verifier": verifier})
+    save({"client_id": cid, "access_token": t["access_token"], "refresh_token": t["refresh_token"],
+          "panel_session": secrets.token_hex(16), "scope": t.get("scope", SCOPES), "expires_at": time.time() + t.get("expires_in", 3600)})
+    me = call("GET", "/me") or {}
+    print(f"spotify: logged in as {me.get('display_name') or me.get('id') or 'you'}"
+          f"{'' if me.get('product') in (None, 'premium') else ' (without Premium: what plays shows, the controls do not work)'}")
+    ensure_ticker()
+    return 0
+
+
+# --- what plays ------------------------------------------------------------------------------------------------
+
+def mmss(ms):
+    s = int(ms or 0) // 1000
+    return f"{s // 60}:{s % 60:02d}"
+
+
+def artists(item):
+    return ", ".join(a.get("name", "") for a in (item or {}).get("artists") or []) or (item or {}).get("show", {}).get("name", "")
+
+
+def clean(v):
+    return "".join(c for c in " ".join(str(v if v is not None else "").split()) if c.isprintable())
+
+
+def playing():
+    """The player: None when nothing plays anywhere."""
+    p = call("GET", "/me/player?additional_types=episode")
+    return p if p and p.get("item") else None
+
+
+def segment(p):
+    """The status line's piece: the track, muted while it plays, dimmer while paused, gone after 5 min of pause."""
+    if option("@pitwall-spotify-segment", "on") == "off" or not p:
+        tmux("set", "-gu", SEG)
+        return
+    item = p["item"]
+    text = option("@pitwall-spotify-format", "{title} · {artist}").format(
+        title=clean(item.get("name")), artist=clean(artists(item)), album=clean((item.get("album") or {}).get("name")))
+    most = int(option("@pitwall-spotify-max", "40") or 40)
+    if len(text) > most:
+        text = text[:most - 1].rstrip() + "…"
+    text = text.replace("#", "##")  # a title is text, never a tmux format
+    tmux("set", "-g", SEG, text if p.get("is_playing") else f"#[fg=#6b7280]{text}")
+
+
+def look():
+    """What plays, onto the status line. Returns the player (or None) and when to look again (or None: stop)."""
+    try:
+        p = playing()
+    except (NeedLogin, SpotifyError, OSError, ValueError):
+        tmux("set", "-gu", SEG)
+        return None, None
+    tmux("set", "-g", "@pitwall_spotify_at", str(int(time.time())))
+    if not p:
+        segment(None)
+        return None, None
+    if p.get("is_playing"):
+        tmux("set", "-gu", "@pitwall_spotify_paused")
+        segment(p)
+        left = (p["item"].get("duration_ms", 0) - (p.get("progress_ms") or 0)) / 1000
+        return p, max(2, min(left + 1, 30))
+    since = int(option("@pitwall_spotify_paused", "0") or 0)
+    if not since:
+        tmux("set", "-g", "@pitwall_spotify_paused", str(int(time.time())))
+        since = int(time.time())
+    if time.time() - since > 300:
+        segment(None)
+        return p, None
+    segment(p)
+    return p, 60
+
+
+def tick():
+    """While music plays (or was just paused): keep the status line's track current. One per tmux server."""
+    pid = option("@pitwall_spotify_tick")
+    if pid and pid.isdigit():
+        try:
+            os.kill(int(pid), 0)
+            return 0  # one is running
+        except OSError:
+            pass
+    tmux("set", "-g", "@pitwall_spotify_tick", str(os.getpid()))
+    try:
+        while True:
+            _, wait = look()
+            if wait is None:
+                return 0
+            time.sleep(wait)
+    finally:
+        tmux("set", "-gu", "@pitwall_spotify_tick")
+
+
+def ensure_ticker():
+    if load().get("refresh_token"):
+        subprocess.run(["tmux", "run-shell", "-b", f"'{SELF}' tick"], capture_output=True)
+
+
+# --- actions ---------------------------------------------------------------------------------------------------
+
+def device():
+    """The device to play on: the active one, else this computer, else any."""
+    ds = (call("GET", "/me/player/devices") or {}).get("devices") or []
+    for pick in (lambda d: d.get("is_active"), lambda d: d.get("type") == "Computer", lambda d: True):
+        for d in ds:
+            if pick(d) and not d.get("is_restricted"):
+                return d
+    return None
+
+
+def control(action, arg=""):
+    """Does it, then says so in a few words. Raises SpotifyError with a sentence a person can act on."""
+    p = playing() if action in ("toggle", "save", "volup", "voldown") else None
+    try:
+        if action == "toggle":
+            if p and p.get("is_playing"):
+                call("PUT", "/me/player/pause")
+                return f"paused «{clean(p['item'].get('name'))}»"
+            if p:
+                call("PUT", "/me/player/play")
+                return f"playing «{clean(p['item'].get('name'))}»"
+            d = device()
+            if not d:
+                raise SpotifyError(404, "NO_DEVICE")
+            call("PUT", "/me/player", {"device_ids": [d["id"]], "play": True})
+            return f"playing on {d.get('name')}"
+        if action == "next":
+            call("POST", "/me/player/next")
+            return "next track"
+        if action == "prev":
+            call("POST", "/me/player/previous")
+            return "previous track"
+        if action in ("shuffle-on", "shuffle-off"):
+            enabled = action == "shuffle-on"
+            call("PUT", "/me/player/shuffle?state=" + ("true" if enabled else "false"))
+            return "shuffle on" if enabled else "shuffle off"
+        if action in ("repeat-off", "repeat-context", "repeat-track"):
+            mode = action.split("-", 1)[1]
+            call("PUT", f"/me/player/repeat?state={mode}")
+            return f"repeat {mode}"
+        if action in ("volup", "voldown", "volume"):
+            if action == "volume":
+                v = int(arg)
+            else:
+                current = ((p or {}).get("device") or {}).get("volume_percent")
+                if current is None:
+                    return "volume unavailable on this device"
+                v = current + (10 if action == "volup" else -10)
+            v = max(0, min(100, v))
+            call("PUT", f"/me/player/volume?volume_percent={v}")
+            return f"volume {v}%"
+        if action in ("save", "unsave"):
+            uri = arg or (p or {}).get("item", {}).get("uri", "")
+            if not uri.startswith("spotify:track:"):
+                return "nothing to save"
+            call("PUT" if action == "save" else "DELETE", f"/me/library?uris={urllib.parse.quote(uri)}")  # /me/tracks is refused now
+            return "saved to your Liked Songs" if action == "save" else "removed from your Liked Songs"
+        if action == "play":
+            body = {"context_uri": arg} if arg.startswith("spotify:playlist:") else {"uris": [arg]}
+            try:
+                call("PUT", "/me/player/play", body)
+            except SpotifyError as e:
+                d = device() if e.status == 404 else None
+                if not d:
+                    raise
+                call("PUT", f"/me/player/play?device_id={d['id']}", body)
+            return "playing it"
+        if action == "queue":
+            call("POST", f"/me/player/queue?uri={urllib.parse.quote(arg)}")
+            return "added to the queue"
+    except SpotifyError as e:
+        if e.status == 403 or "PREMIUM" in e.reason:
+            raise SpotifyError(403, "Spotify needs Premium for that") from e
+        if e.status == 404 or "DEVICE" in e.reason:
+            raise SpotifyError(404, "no device plays: open Spotify somewhere first") from e
+        raise
+    return action
+
+
+def act(action, row, answer=""):
+    uri = row.split(":", 1)[1] if ":" in row else ""
+    try:
+        said = control(action, uri if action in ("play", "queue", "save", "unsave") else answer)
+        print(f"notice\t{said}")
+    except NeedLogin:
+        print("notice\tspotify: log in first (pitwall spotify login)")
+    except SpotifyError as e:
+        print(f"notice\t{e.reason}")
+    except (OSError, ValueError) as e:
+        print(f"notice\tSpotify did not answer ({e})")
+    time.sleep(0.4)  # Spotify takes a moment to move to the next track
+    look()
+    ensure_ticker()
+    print("refresh")
+    return 0
+
+
+# --- the view --------------------------------------------------------------------------------------------------
+
+def bar(pct, cells=24):
+    full = max(0, min(cells, round(pct * cells)))
+    return "{amber}" + "▰" * full + "{dim}" + "▱" * (cells - full)
+
+
+def rec(*fields):
+    print("\t".join(clean(value) for value in fields))
+
+
+def login_action(label):
+    rec("act", "-", "login", "l", label, "Approve access in your browser.", "tab", "spotify",
+        os.path.expanduser("~"), f"'{PITWALL}' spotify login && sleep 2 && exit")
+
+
+def pages(path):
+    offset = 0
+    while True:
+        page = call("GET", f"{path}?limit=50&offset={offset}")
+        items = page["items"]
+        yield from (item for item in items if item)
+        if not page.get("next") or not items:
+            return
+        offset += len(items)
+
+
+def playlist_catalogue():
+    # The player refreshes near every track change. Reuse its catalogue for five minutes in this popup.
+    cache = os.environ.get("PITWALL_VIEW_CACHE")
+    if cache:
+        try:
+            modified = os.path.getmtime(cache)
+            if modified >= os.path.getmtime(CONF) and time.time() - modified < 300:
+                with open(cache) as f:
+                    return json.load(f)
+        except (OSError, ValueError):
+            pass
+    playlists = []
+    for pl in pages("/me/playlists"):
+        pid = pl.get("id") or ""
+        if re.fullmatch("[A-Za-z0-9]+", pid):
+            playlists.append((pid, pl.get("name") or pid, (pl.get("owner") or {}).get("display_name") or ""))
+    if cache:
+        try:
+            with open(cache, "w") as f:
+                json.dump(playlists, f)
+        except OSError:
+            pass
+    return playlists
+
+
+def playlist_rows():
+    rec("head", "YOUR PLAYLISTS", "spotlight")
+    if "playlist-read-private" not in load().get("scope", "").split():
+        login_action("Connect playlists")
+        return "fresh"
+    try:
+        playlists = playlist_catalogue()
+    except (NeedLogin, SpotifyError, OSError, ValueError) as e:
+        rec("act", "-", "retry", "r", "Retry loading playlists", str(e), "refresh")
+        return failure_state(e)
+    if not playlists:
+        rec("act", "-", "open", "o", "No saved playlists · open Spotify", "Your Spotify library.", "open", "spotify:")
+    for pid, title, owner in playlists:
+        uri = f"spotify:playlist:{pid}"
+        rid = f"list:{uri}"
+        rec("row", rid, "{green}♫", title, owner, f"spotify playlist {title} {owner}", "", 0)
+        rec("act", rid, "browse", "⏎", "Browse tracks", "Search this playlist.", "page", pid)
+        rec("act", rid, "play", "p", "Play playlist", "Start playback on your device.", "run")
+        rec("act", rid, "open", "o", "Open in Spotify", "Open the playlist.", "open", uri)
+        rec("side", rid, "{bold}", title)
+        rec("side", rid, "{muted}", owner)
+    return "fresh"
+
+
+def track_row(prefix, t, meta):
+    if not t or not t.get("uri"):
+        return
+    rid = f"{prefix}:{t['uri']}"
+    title, who = clean(t.get("name")), clean(artists(t))
+    rec("row", rid, "{muted}·", f"{title} · {who}", f"{{dim}}{meta}", f"{title} {who} {clean((t.get('album') or {}).get('name'))}", "", 0)
+    rec("act", rid, "play", "⏎", "Play it now", "Plays this track now; what was playing stops.", "run")
+    if prefix != "q":
+        rec("act", rid, "queue", "a", "Add to the queue", "After what plays now.", "run")
+    if t["uri"].startswith("spotify:track:"):
+        rec("act", rid, "save", "s", "Save to your Liked Songs", "The same as the heart in Spotify.", "run")
+    rec("side", rid, "{dim}", clean((t.get("album") or {}).get("name")).upper())
+    rec("side", rid, "{bold}{text}", title)
+    rec("side", rid, "{muted}", who)
+
+
+def failure_state(error):
+    if isinstance(error, NeedLogin) or isinstance(error, SpotifyError) and error.status in (401, 403, 404):
+        return "clear"
+    return "retry"
+
+
+def session_key(conf):
+    if not conf.get("refresh_token"):
+        return ""
+    return conf.get("panel_session") or hashlib.sha256(conf["refresh_token"].encode()).hexdigest()
+
+
+def panel(page):
+    if page and not re.fullmatch("[A-Za-z0-9]+", page):
+        return 1
+    session = session_key(load())
+    if not session:
+        playlist_view(page) if page else view()
+        return 0
+
+    started = time.time_ns()
+    # A new login, plugin version or API must never replay another view's actions.
+    owner = f"{session}:{API}:{CONF}:{PITWALL}:{os.stat(SELF).st_mtime_ns}"
+    cached = None
+    db = None
+    try:
+        os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+        db = sqlite3.connect(PANELS, timeout=0.2)
+        db.execute("CREATE TABLE IF NOT EXISTS panels (page TEXT PRIMARY KEY, owner TEXT, started INTEGER, records TEXT)")
+        cached = db.execute("SELECT records FROM panels WHERE page=? AND owner=? AND records IS NOT NULL",
+                            (page, owner)).fetchone()
+    except (OSError, sqlite3.Error):
+        pass  # A read-only or unavailable cache still gets a live view.
+
+    try:
+        preview = os.environ.get("PITWALL_VIEW_PREVIEW")
+        if cached and preview:
+            try:
+                with open(preview + ".tmp", "w") as f:
+                    f.write(cached[0] + "hint\tLast seen · refreshing…\n")
+                os.replace(preview + ".tmp", preview)
+            except OSError:
+                pass
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            state = playlist_view(page) if page else view()
+        records = output.getvalue()
+        if session != session_key(load()):
+            rec("head", "SPOTIFY LOGIN CHANGED")
+            rec("act", "-", "retry", "r", "Refresh Spotify", "Reload for the current login.", "refresh")
+            return 0
+        if state == "retry" and cached:
+            records = cached[0] + "hint\tLast seen · refresh failed\nevery\t30\n"
+        elif db and state != "retry":
+            try:
+                with db:
+                    db.execute("INSERT INTO panels VALUES (?, ?, ?, ?) ON CONFLICT(page) DO UPDATE SET "
+                               "owner=excluded.owner, started=excluded.started, records=excluded.records "
+                               "WHERE excluded.started >= panels.started",
+                               (page, owner, started, records if state == "fresh" else None))
+            except sqlite3.Error:
+                pass
+        sys.stdout.write(records)
+    finally:
+        if db:
+            db.close()
+    return 0
+
+
+def playlist_view(pid):
+    rec("hint", "tracks · artists · albums")
+    rec("unit", "track", "tracks")
+    rec("every", 300)
+    rec("head", "PLAYLIST TRACKS", "count")
+    occurrences = {}
+    state = "fresh"
+    try:
+        for entry in pages(f"/playlists/{pid}/items"):
+            item = entry.get("item") or entry.get("track")
+            if item and (item.get("uri") or "").startswith(("spotify:track:", "spotify:episode:")) and not entry.get("is_local"):
+                uri = item["uri"]
+                n = occurrences.get(uri, 0)
+                track_row(f"pl{n}", item, mmss(item.get("duration_ms")))
+                occurrences[uri] = n + 1
+        if occurrences:
+            return state
+        reason = "No playable tracks"
+    except NeedLogin:
+        login_action("Reconnect Spotify")
+        return "clear"
+    except (SpotifyError, OSError, ValueError) as e:
+        state = failure_state(e)
+        reason = "Spotify restricts access to these tracks" if isinstance(e, SpotifyError) and e.status == 403 else "Could not load all tracks"
+        rec("act", "-", "retry", "r", "Try again", str(e), "refresh")
+    rec("head", reason.upper())
+    rec("act", "-", "open", "o", "Open playlist in Spotify", reason, "open", f"spotify:playlist:{pid}")
+    return state
+
+
+def view():
+    try:
+        p = playing()
+    except NeedLogin:
+        rec("every", 60)
+        rec("head", "SPOTIFY IS NOT CONNECTED")
+        login_action("Log in: the browser opens, one click")
+        return "clear"
+    except (SpotifyError, OSError, ValueError) as e:
+        rec("every", 30)
+        rec("badge", "{red}✗")
+        rec("head", "SPOTIFY IS NOT ANSWERING")
+        rec("act", "-", "retry", "r", "Try again", f"Spotify said: {getattr(e, 'reason', e)}. This view looks again on its own every 30 s.", "refresh")
+        playlist_rows()
+        return failure_state(e)
+    def extra(path, pick, default):  # what only adds to the view: a refusal here leaves the rest standing
+        try:
+            return pick(call("GET", path) or {})
+        except (NeedLogin, SpotifyError, OSError, ValueError, TypeError, IndexError):
+            return default
+    recent = extra("/me/player/recently-played?limit=10", lambda d: d.get("items") or [], [])
+    queue = extra("/me/player/queue", lambda d: (d.get("queue") or [])[:8], []) if p else []
+    uri = (p or {}).get("item", {}).get("uri", "")
+    liked = uri.startswith("spotify:track:") and extra(f"/me/library/contains?uris={urllib.parse.quote(uri)}", lambda d: bool(d[0]), False)
+    rec("unit", "track", "tracks")
+    rec("hint", "tracks · artists · playlists")
+    if p:
+        item, on = p["item"], p.get("is_playing")
+        dev = p.get("device") or {}
+        left = (item.get("duration_ms", 0) - (p.get("progress_ms") or 0)) / 1000
+        rec("every", int(max(3, min(left + 1, 30))) if on else 60)
+        rec("badge", "{green}▶" if on else "{dim}⏸")
+        rec("right", f"{dev.get('name', '')} · volume {dev.get('volume_percent', '?')}%")
+        rid = f"now:{uri}"
+        title, who, album = clean(item.get("name")), clean(artists(item)), clean((item.get("album") or {}).get("name"))
+        rec("head", "NOW PLAYING" if on else "PAUSED")
+        rec("row", rid, "{green}▶" if on else "{dim}⏸", f"{title} · {who}", f"{{dim}}{mmss(p.get('progress_ms'))} / {mmss(item.get('duration_ms'))}",
+            f"{title} {who} {album}", "", int(time.time()))
+        rec("act", rid, "toggle", "⏎", "Pause" if on else "Play", "Pauses or plays, on the device that plays.", "run")
+        rec("act", rid, "next", "]", "Next track", "Skips to the next track.", "run")
+        rec("act", rid, "prev", "[", "Previous track", "Back to the previous track (or the start of this one).", "run")
+        if liked:
+            rec("act", rid, "unsave", "s", "Remove from your Liked Songs", "It stays in your playlists.", "run")
+        else:
+            rec("act", rid, "save", "s", "Save to your Liked Songs", "The same as the heart in Spotify.", "run")
+        rec("act", rid, "volup", "+", "Volume up", "Ten points up, on the device that plays.", "run")
+        rec("act", rid, "voldown", "-", "Volume down", "Ten points down.", "run")
+        if item.get("uri"):
+            rec("act", rid, "open", "o", "Open in Spotify", "The track in the Spotify app.", "open", item["uri"])
+        disallows = (p.get("actions") or {}).get("disallows") or {}
+        shuffle = p.get("shuffle_state")
+        repeat = p.get("repeat_state")
+        next_repeat = {"off": "context", "context": "track", "track": "off"}.get(repeat)
+        can_shuffle = isinstance(shuffle, bool) and not disallows.get("toggling_shuffle")
+        repeat_capability = "toggling_repeat_track" if "track" in (repeat, next_repeat) else "toggling_repeat_context"
+        can_repeat = next_repeat and not disallows.get(repeat_capability)
+        if can_shuffle:
+            target = "off" if shuffle else "on"
+            rec("act", rid, f"shuffle-{target}", "z", f"Turn shuffle {target}", "Change the order of playback.", "run")
+        if can_repeat:
+            rec("act", rid, f"repeat-{next_repeat}", "r", f"Repeat {next_repeat}", "Cycle repeat between context, track and off.", "run")
+
+        year = ((item.get("album") or {}).get("release_date") or "")[:4]
+        rec("side", rid, "{bold}{text}", title)
+        rec("side", rid, "{text}", who)
+        if album:
+            rec("side", rid, "{muted}", " · ".join(filter(None, (album, year))))
+        rec("side", rid, "", "")
+        pct = (p.get("progress_ms") or 0) / max(1, item.get("duration_ms") or 1)
+        rec("side", rid, "", f"{bar(pct)}{{/}} {{text}}{mmss(p.get('progress_ms'))} / {mmss(item.get('duration_ms'))}")
+        rec("side", rid, "", "")
+        if isinstance(shuffle, bool):
+            rec("side", rid, "{text}", f"Shuffle  {'on' if shuffle else 'off'}" + ("  ·  ctrl-z" if can_shuffle else ""))
+        if repeat:
+            rec("side", rid, "{text}", f"Repeat   {repeat}" + ("  ·  ctrl-r" if can_repeat else ""))
+        rec("side", rid, "{muted}", "Shift-tab then [ previous · ] next")
+        rec("side", rid, "{muted}", "Shift-tab then -/+ volume")
+        if liked:
+            rec("side", rid, "", "{green}♥{/} {muted}in your Liked Songs")
+        if queue and queue[0] and queue[0].get("name"):
+            rec("side", rid, "", "")
+            rec("side", rid, "{dim}", "UP NEXT")
+            rec("side", rid, "{text}", " · ".join(filter(None, (queue[0]["name"], artists(queue[0])))))
+    else:
+        rec("every", 60)
+        rec("head", "NOTHING IS PLAYING")
+        rec("act", "-", "toggle", "p", "Play: pick up where you left off", "On the device you used last, or this computer.", "run")
+        rec("act", "-", "open", "o", "Open Spotify", "The Spotify app.", "open", "spotify:")
+
+    if queue:
+        rec("head", "UP NEXT", "count timeline")
+        for t in queue:
+            track_row("q", t, mmss(t.get("duration_ms")))
+    if recent:
+        rec("head", "RECENTLY PLAYED", "count")
+        day = time.strftime("%Y%j")
+        for r in recent:
+            at = r.get("played_at", "")[:19]
+            try:
+                e = calendar.timegm(time.strptime(at, "%Y-%m-%dT%H:%M:%S"))  # played_at is UTC
+                meta = time.strftime("%H:%M" if time.strftime("%Y%j", time.localtime(e)) == day else "%a %H:%M", time.localtime(e)).lower()
+            except ValueError:
+                meta = ""
+            track_row("r", r.get("track"), meta)
+    state = playlist_rows()
+    look_quietly(p)
+    return state
+
+
+def look_quietly(p):
+    """The view just read the player: the status line follows, and the ticker starts if the music plays."""
+    if p and p.get("is_playing"):
+        segment(p)
+        ensure_ticker()
+
+
+# --- pitwall spotify … -----------------------------------------------------------------------------------------
+
+def status():
+    conf = load()
+    if not conf.get("refresh_token"):
+        print("spotify: not logged in (pitwall spotify login)")
+        return 1
+    try:
+        me = call("GET", "/me") or {}
+        p = playing()
+    except NeedLogin:
+        print("spotify: the login expired or was revoked (pitwall spotify login)")
+        return 1
+    except (SpotifyError, OSError, ValueError) as e:
+        print(f"spotify: Spotify did not answer ({getattr(e, 'reason', e)})")
+        return 1
+    what = "nothing plays"
+    if p:
+        what = f"{'playing' if p.get('is_playing') else 'paused'} «{clean(p['item'].get('name'))}» by {clean(artists(p['item']))} on {(p.get('device') or {}).get('name', '?')}"
+    plan = f" ({me['product']})" if me.get("product") else ""  # Spotify no longer tells every app the plan
+    print(f"spotify: {me.get('display_name') or me.get('id')}{plan}, {what}")
+    return 0
+
+
+def cmd(args):
+    verb, rest = (args[0] if args else "status"), args[1:]
+    if verb == "login":
+        return login()
+    if verb == "logout":
+        if os.path.exists(CONF):
+            os.remove(CONF)
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(PANELS)
+        tmux("set", "-gu", SEG)
+        print("spotify: logged out")
+        return 0
+    if verb == "status":
+        return status()
+    names = {"toggle": "toggle", "play": "toggle", "pause": "toggle", "next": "next", "prev": "prev", "previous": "prev",
+             "like": "save", "save": "save", "unlike": "unsave", "volume": "volume"}
+    if verb in names:
+        if verb == "volume":
+            if not rest:
+                print("usage: pitwall spotify volume <0-100 | + | ->", file=sys.stderr)
+                return 1
+            action, arg = {"+": ("volup", ""), "-": ("voldown", "")}.get(rest[0], ("volume", rest[0]))
+        else:
+            action, arg = names[verb], ""
+        try:
+            print(f"spotify: {control(action, arg)}")
+        except NeedLogin:
+            print("spotify: not logged in (pitwall spotify login)", file=sys.stderr)
+            return 1
+        except SpotifyError as e:
+            print(f"spotify: {e.reason}", file=sys.stderr)
+            return 1
+        time.sleep(0.4)
+        look()
+        ensure_ticker()
+        return 0
+    print("usage: pitwall spotify login | logout | status | toggle | next | prev | like | volume <0-100|+|->", file=sys.stderr)
+    return 1
+
+
+def hook(event, args):
+    """A lane moved. If nobody looked at the player for two minutes and no ticker runs, look once."""
+    if event != "lane.state" or not load().get("refresh_token") or option("@pitwall_spotify_tick"):
+        return 0
+    if time.time() - int(option("@pitwall_spotify_at", "0") or 0) > 120:
+        _, wait = look()
+        if wait is not None:
+            ensure_ticker()
+    return 0
+
+
+def main():
+    a = sys.argv[1:]
+    verb = a[0] if a else ""
+    if verb == "hook" and len(a) >= 2:
+        return hook(a[1], a[2:])
+    if verb == "view":
+        return panel(a[1] if len(a) > 1 else "")
+    if verb == "act" and len(a) >= 3:
+        return act(a[1], a[2], a[3] if len(a) > 3 else "")
+    if verb == "cmd":
+        return cmd(a[1:])
+    if verb == "tick":
+        return tick()
+    print(__doc__.strip(), file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
