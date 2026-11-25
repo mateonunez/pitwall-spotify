@@ -26,6 +26,7 @@ eq "and kept, readable by you alone" "$(python3 -c 'import json,sys; print(json.
 eq "the view: now playing, up next, recently played" "$(printf '%s\n' "$V" | grep '^head' | cut -f2 | tr '\n' '|')" "NOW PLAYING|UP NEXT|RECENTLY PLAYED|YOUR PLAYLISTS|"
 eq "the track's row, with where it is" "$(printf '%s\n' "$V" | grep '^row	now:' | cut -f4,5)" "Song #1 with a title long enough to be cut short · The Band	{dim}0:50 / 3:20"
 eq "its first action pauses" "$(printf '%s\n' "$V" | grep '^act	now:' | head -1 | cut -f3,4,5)" "toggle	⏎	Pause"
+eq "the tab pins the current track and its transport keys" "$(printf '%s\n' "$V" | awk -F '\t' '$1=="pin" {print $2, $3}')" "now:spotify:track:t1 v:[ k:⏎ t:] z:z r:r"
 eq "the device and its volume on the right, a ▶ on the tab" "$(printf '%s\n' "$V" | grep '^right' | cut -f2) $(printf '%s\n' "$V" | grep '^badge' | cut -f2)" "MacBook · volume 60% {green}▶"
 eq "the status line's piece: cut to 40, # doubled for tmux" "$(tmux show -gqv @pitwall_seg_spotify)" "Song ##1 with a title long enough to be…"
 eq "an existing login still shows the player and offers the new permission" "$(printf '%s\n' "$V" | grep -c 'Connect playlists')" 1
@@ -45,12 +46,12 @@ eq "both pages of playlists are searchable by name or owner" "$(printf '%s\n' "$
 eq "a player refresh reuses the popup catalogue" "$(grep -c 'GET /v1/me/playlists' "$LOG")" 2
 eq "Enter browses a playlist by id" "$(printf '%s\n' "$V" | grep '^act	list:spotify:playlist:listA' | head -1 | cut -f7,8)" "page	listA"
 P=$("$SP" view listA)
-eq "all pages of playable items are listed, including repeated tracks" "$(printf '%s\n' "$P" | grep '^row' | cut -f2 | tr '\n' '|')" "pl0:spotify:track:t1|pl1:spotify:track:t1|"
+eq "all pages keep the raw positions of playable items, including repeated tracks" "$(printf '%s\n' "$P" | grep '^row' | cut -f2 | tr '\n' '|')" "pl:listA:1:spotify:track:t1|pl:listA:4:spotify:track:t1|"
 eq "a followed playlist with restricted tracks opens in Spotify" "$("$SP" view listB | grep -c 'open	spotify:playlist:listB')" 1
 eq "an empty playlist explains itself" "$("$SP" view empty | grep -c '^head	NO PLAYABLE TRACKS')" 1
 tmux set -g @pitwall-spotify-format '{artist}'
 "$SP" act toggle "now:spotify:track:t1" >"$LOG.act"
-eq "⏎ pauses through the API, says so, and asks the view to look again" "$(grep -c 'PUT /v1/me/player/pause' "$LOG") $(tr '\n' '|' <"$LOG.act")" "1 notice	paused «Song #1 with a title long enough to be cut short»|refresh|"
+eq "⏎ pauses through the API, says so, and asks the player to look again" "$(grep -c 'PUT /v1/me/player/pause' "$LOG") $(tr '\n' '|' <"$LOG.act")" "1 notice	paused «Song #1 with a title long enough to be cut short»|refresh	root|"
 eq "paused, the piece dims, in the format you set" "$(tmux show -gqv @pitwall_seg_spotify)" "#[fg=#6b7280]The Band"
 "$SP" act play "r:spotify:track:r1" >/dev/null
 eq "a recent track plays on ⏎" "$(grep -c 'PUT /v1/me/player/play' "$LOG")" 1
@@ -62,6 +63,14 @@ tmux set -g @pitwall-spotify-segment off
 eq "@pitwall-spotify-segment off keeps the status line clear" "$(tmux show -gqv @pitwall_seg_spotify)" ""
 "$SP" act play "list:spotify:playlist:listA" >/dev/null
 eq "play a playlist uses its Spotify context" "$(grep -c '^play {"context_uri": "spotify:playlist:listA"}' "$LOG")" 1
+row=$(printf '%s\n' "$P" | awk -F '\t' '$1 == "row" && $4 ~ /Last Song/ { print $2 }')
+"$SP" act play "$row" >"$LOG.act"
+eq "a track starts at its position and stays in the playlist context" "$(grep -Fc 'play {"context_uri": "spotify:playlist:listA", "offset": {"position": 4}}' "$LOG") $(grep -c '^refresh	root$' "$LOG.act")" "1 1"
+eq "the player shows the playlist it is playing from" "$("$SP" view | grep -c 'Playlist · Night Drive')" 1
+"$SP" act queue "$row" >/dev/null
+eq "queueing a playlist track calls the queue endpoint" "$(grep -c 'POST /v1/me/player/queue' "$LOG")" 1
+"$SP" cmd unlike >/dev/null
+eq "unlike removes the current track" "$(grep -c 'DELETE /v1/me/library' "$LOG") $("$SP" view | grep -c '^act	now:.*	save	s')" "1 1"
 "$SP" act shuffle-on "now:spotify:track:t1" >/dev/null
 eq "shuffle shows its new state and offers to switch it off" "$("$SP" view | grep -c 'shuffle-off	z	Turn shuffle off')" 1
 for pair in 'context track' 'track off' 'off context'; do
@@ -82,6 +91,30 @@ eq "a playlist page restores its own last tracks" "$(grep -c '^row	pl' "$PITWALL
 rm "$PITWALL_VIEW_PREVIEW"
 "$SP" view empty >/dev/null
 eq "a different playlist cannot restore those tracks" "$(grep -c '^row	pl' "$PITWALL_VIEW_PREVIEW")" 0
+touch "$LOG.idle"
+eq "the player stays available when there is no current track" "$("$SP" view | grep -c '^pin	-	k:p$')" 1
+rm -f "$LOG.idle"
+
+progressive() { # hold the second API page until we have seen the first
+    rm -f "$XDG_CONFIG_HOME/progressive"
+    touch "$LOG.hold"
+    XDG_CACHE_HOME="$XDG_CONFIG_HOME/cold" PITWALL_VIEW_CACHE='' PITWALL_VIEW_PREVIEW="$XDG_CONFIG_HOME/progressive" \
+        "$SP" view "$1" >"$XDG_CONFIG_HOME/final" &
+    vpid=$!
+    n=0
+    until grep -q "$2" "$XDG_CONFIG_HOME/progressive" 2>/dev/null || [ "$n" -ge 60 ]; do
+        sleep 0.05; n=$((n + 1))
+    done
+    eq "the first page is searchable while the next page is pending" \
+        "$(grep -c "$2" "$XDG_CONFIG_HOME/progressive") $(grep -c "$3" "$XDG_CONFIG_HOME/progressive")" "1 0"
+    rm "$LOG.hold"
+    wait "$vpid"
+    eq "both pages appear in the final result" \
+        "$(grep -c "$2" "$XDG_CONFIG_HOME/final") $(grep -c "$3" "$XDG_CONFIG_HOME/final")" "1 1"
+}
+progressive '' '^row.*Night Drive' '^row.*Lazy Sunday'
+progressive listA '^row.*Song #1' '^row.*Last Song'
+
 kill "$API"; wait "$API" 2>/dev/null || :
 V=$("$SP" view)
 eq "an offline refresh keeps the last rows and labels them stale" "$(printf '%s\n' "$V" | grep -c '^row	list:') $(printf '%s\n' "$V" | grep -c 'Last seen · refresh failed')" "2 1"
