@@ -43,7 +43,15 @@ Then give me its client ID: in `SPOTIFY_CLIENT_ID`, or in a `.env` beside the pl
 
 When you reopen the dashboard or a playlist, the last successful view appears while Spotify refreshes it. You can search and move immediately. If Spotify is offline, the hint marks the saved view and the dashboard retries automatically.
 
-**Find a playlist from the main search.** Open `prefix Space` and type its name or owner, or type `playlist` to list them all. Press Enter to browse. Inside the playlist, type a track, artist or album to narrow the list. Use `ctrl-n` and `ctrl-e` to move and Enter to play the highlighted track. Esc clears the track filter, then takes you back to the playlist you picked. To play the whole playlist, choose *Play playlist* from its actions (`shift-tab`, then `p`).
+On a first open, playlists and tracks become searchable as each page from Spotify arrives. Use Page Up and Page Down to move by a screen of matching results. If you close the popup from Spotify, the next popup on the same tmux server restores the playlist, search and selected row for that login.
+
+Playing a track inside a playlist starts at that track and keeps the playlist as the playback context. Pitwall keeps your filter and selection while the player updates. The player shows the current playlist when it appears in your library.
+
+The timer advances locally each second during playback. Spotify refreshes the position while its tab or a playlist is open. Paused playback and saved snapshots keep their last confirmed position.
+
+The right pane keeps the player above the selected track or playlist. While browsing or filtering, use `ctrl-v` for the previous track, `ctrl-k` to pause or resume, and `ctrl-t` for the next track. Shuffle (`ctrl-z`) and repeat (`ctrl-r`) are available when the device supports them. Enter acts on the highlighted row.
+
+**Find a playlist from the main search.** Open `prefix Space` and type its name or owner, or type `playlist` to list them all. Press Enter to browse. Inside the playlist, type a track, artist or album to narrow the list. Use `ctrl-n` and `ctrl-e` to move and Enter to play the highlighted track. Esc clears the track filter, then takes you back to the playlist you picked. To play the whole playlist, choose *Play playlist* from its actions (`→`, then `p`).
 
 Run `pitwall spotify login` again to approve the expanded permissions. Login requests 19 user scopes for playback, playlists, artwork, follows, listening history, library and profile. Adding `user-personalized` to this grant was rejected with `invalid_scope`. Open Access permissions cover partner integrations. [Spotify scopes](https://developer.spotify.com/documentation/web-api/concepts/scopes)
 
@@ -52,13 +60,13 @@ Spotify allows apps to read the tracks of playlists you own or collaborate on. F
 | Key | On what plays | On a track up next or played recently |
 | --- | --- | --- |
 | `⏎` | Pause, or play | Play it now |
-| `shift-tab`, then `]` `[` | Next, previous | |
+| `→`, then `]` `[` | Next, previous | |
 | `ctrl-z` | Turn shuffle on or off | |
 | `ctrl-r` | Cycle repeat through context, track and off | |
-| `shift-tab`, then `+` `-` | Volume | |
+| `→`, then `+` `-` | Volume | |
 | `ctrl-s` | Save to your Liked Songs (or remove it) | Save it |
-| `shift-tab`, then `a` | | Add it to the queue (played recently) |
-| `shift-tab`, then `o` | Open it in Spotify | |
+| `→`, then `a` | | Add it to the queue (played recently) |
+| `→`, then `o` | Open it in Spotify | |
 
 Nothing plays? The view's first line, *Play*, picks up where you left off, on the device you used last or on this computer.
 
@@ -105,6 +113,7 @@ Its piece of the bottom line is a tmux option it sets, `@pitwall_seg_spotify`. p
 
 ```sh
 sh test/run.sh   # against a fake Spotify and a throwaway tmux server
+sh test/dashboard.sh ../pitwall   # exercises playback progress and reopening the popup
 ```
 
 ## Privacy
